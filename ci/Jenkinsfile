@@ -1,0 +1,142 @@
+pipeline {
+  agent none
+  options { skipStagesAfterUnstable() }
+  environment {
+    PROJECT_NAME    = "axon-homework"
+  }
+
+  stages {
+    stage('Run Tests') {
+      when {
+        anyOf {
+            changeRequest()
+            branch 'master'  
+          }
+        }
+      agent {
+        kubernetes {
+          label "pod-${PROJECT_NAME}-tests"
+          defaultContainer 'ci-container'
+          yamlFile 'ci/k8s-ci.yml'
+        }
+      }
+      steps {
+        container('ci-container') {
+          sh label: 'Run tests', script: '''pip install request coverage pytest pytest-cov
+                                coverage run -m unittest discover
+                                coverage xml
+                                '''
+          archiveArtifacts artifacts: "coverage.xml" , fingerprint: true
+  
+          cobertura(
+            coberturaReportFile: "coverage.xml",
+            onlyStable: false,
+            failNoReports: true,
+            failUnhealthy: false,
+            failUnstable: false,
+            autoUpdateHealth: true,
+            autoUpdateStability: false,
+            zoomCoverageChart: true,
+            maxNumberOfBuilds: 0,
+            lineCoverageTargets: '80, 80, 80',
+            conditionalCoverageTargets: '80, 80, 80',
+            classCoverageTargets: '80, 80, 80',
+            fileCoverageTargets: '80, 80, 80',
+          )
+          cleanWs notFailBuild: true
+        }
+      }
+      post {
+        unstable {
+          slackSend (color: '#FFFF33', message: "Unit tests is currently in ${currentBuild.currentResult} status :thunder_cloud_and_rain:  :thunder_cloud_and_rain: . There will be no deployments. Please check the code coverage here (${env.BUILD_URL}) " )
+        }
+        failure {
+          slackSend (color: '#FF0000', message: "Unit tests is BELOW required target: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+        }
+      }
+    }
+
+    stage('Development Build') {
+      when {
+        branch "develop"
+        beforeAgent true
+      }
+
+      agent {
+        kubernetes {
+          label "pod-${PROJECT_NAME}-dev"
+          defaultContainer 'docker-dind'
+          yamlFile 'ci/k8s-ci.yml'
+        }
+      }
+
+      environment {
+        GIT_COMMIT_SHORT = sh(
+          script: "printf \$(git rev-parse --short ${GIT_COMMIT})",
+          returnStdout: true
+        )
+        BUILD_IMAGE = "${PROJECT_NAME}:${GIT_COMMIT_SHORT}"
+        registry = "ducminhle/axon_homework"
+        registryCredential = 'dockerhub'
+      }
+      steps {
+        container('docker-dind-awscli') {
+          sh label: 'Build docker image', script: '''
+                                dockerImage = docker.build registry + ":$BUILD_IMAGE" 
+                                docker.withRegistry( '', registryCredential ) {
+                                  dockerImage.push()
+                                }
+                                '''
+        }
+      }
+      post {
+        failure {
+          slackSend (color: '#FF0000', message: "BUILD FAILED: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+        }
+      }
+    }
+
+    stage('Development Release') {
+      when {
+        branch "master"
+        beforeAgent true
+      }
+      agent {
+        kubernetes {
+          label "pod-${PROJECT_NAME}-dev"
+          defaultContainer 'docker-dind'
+          yamlFile 'ci/k8s-ci.yml'
+        }
+      }
+      environment {
+        GIT_COMMIT_SHORT = sh(
+          script: "printf \$(git rev-parse --short ${GIT_COMMIT})",
+          returnStdout: true
+        )
+        registry = "ducminhle/axon_homework"
+        ENV = "development"
+        NAMESPACE = "default"
+        KUBECONFIG = "/root/.kube/kubeconfig"
+      }
+      steps {
+        container('helm') {
+          sh label: 'Deploy to development', script: '''helm init --client-only
+                                helm upgrade ${PROJECT_NAME} ./ci/helm-charts/axon-homework --atomic --install --namespace ${NAMESPACE} --set-string image.repository=${registry} --set-string image.tag=${GIT_COMMIT_SHORT} --wait -f ./ci/helm_vars/values.yaml
+                                '''
+        }
+      }
+      post {
+        success {
+          slackSend (color: '#00FF00', message: "RELEASE SUCCESSFUL: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL}) (${env.BUILD_IMAGE})")
+        }
+        unstable {
+          slackSend (color: '#FFFF33', message: "RELEASE is currently in ${currentBuild.currentResult} status :thunder_cloud_and_rain:  :thunder_cloud_and_rain: . There will be no deployments. Please check the code coverage here (${env.BUILD_URL}) " )
+        }
+        failure {
+          slackSend (color: '#FF0000', message: "RELEASE FAILED: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+        }
+      }
+    }  
+  }
+}
+
